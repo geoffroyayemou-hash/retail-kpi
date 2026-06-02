@@ -1,144 +1,137 @@
-"""
-Retail Demand & Staffing Model — Analysis Script
-Author: Geoffroy Ayemou
-Description: Aggregates daily sales and labor data, applies statistical analysis
-             to demand patterns across day-part and day-of-week, and models
-             optimal staffing thresholds for Tableau dashboard consumption.
-"""
+# retail demand + staffing model
+# pulled sales and labor data from my time managing at mod pizza
+# want to see if day-of-week and time of day actually predict demand the way it felt like they did
 
 import pandas as pd
 import numpy as np
-try:
-    from scipy import stats
-    HAS_SCIPY = True
-except ImportError:
-    HAS_SCIPY = False
-    print("scipy not installed — ANOVA will use manual calculation")
 import matplotlib.pyplot as plt
 import os
 
-# ─── 1. LOAD DATA ─────────────────────────────────────────────────────────────
 df = pd.read_csv("sales_labor_data.csv", parse_dates=["date"])
-print(f"Loaded {len(df)} records")
+print(f"loaded {len(df)} records")
 print(df.head())
 
-# ─── 2. DATA CLEANING & ENRICHMENT ────────────────────────────────────────────
-# Check nulls
-print("\nNull counts:\n", df.isnull().sum())
+# --- cleaning + derived columns ---
 
-# Compute derived KPIs
-df["sales_per_labor_hour"] = df["sales_usd"] / df["labor_hours"]
-df["sales_per_transaction"] = df["sales_usd"] / df["transactions"]
-df["labor_to_sales_ratio"] = df["labor_hours"] / df["sales_usd"] * 100  # labor hrs per $100 revenue
+print("\nnull counts:")
+print(df.isnull().sum())
 
-# Categorical ordering
+# sales per labor hour - my main efficiency metric
+df["sales_per_labor_hr"] = df["sales_usd"] / df["labor_hours"]
+
+# labor to sales ratio - how many labor hours per $100 revenue
+# this is what i actually tracked as a manager
+df["labor_to_sales_pct"] = df["labor_hours"] / df["sales_usd"] * 100
+
+# categorical ordering so charts come out in day order instead of alphabetical
 dow_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-dp_order = ["morning","midday","afternoon","evening","night"]
+dp_order  = ["morning","midday","afternoon","evening","night"]
 df["day_of_week"] = pd.Categorical(df["day_of_week"], categories=dow_order, ordered=True)
-df["day_part"] = pd.Categorical(df["day_part"], categories=dp_order, ordered=True)
+df["day_part"]    = pd.Categorical(df["day_part"], categories=dp_order, ordered=True)
 
-# ─── 3. DEMAND PATTERN ANALYSIS ───────────────────────────────────────────────
-print("\n=== AVERAGE SALES BY DAY-OF-WEEK ===")
-dow_sales = df.groupby("day_of_week", observed=True)["sales_usd"].agg(["mean","std","count"])
-print(dow_sales.round(2))
+# --- demand patterns ---
 
-print("\n=== AVERAGE SALES BY DAY-PART ===")
-dp_sales = df.groupby("day_part", observed=True)["sales_usd"].agg(["mean","std","count"])
-print(dp_sales.round(2))
+print("\n--- avg sales by day of week ---")
+dow = df.groupby("day_of_week", observed=True)["sales_usd"].agg(["mean","std"])
+print(dow.round(2))
 
-print("\n=== SALES × DAY-PART PIVOT ===")
-pivot = df.pivot_table(values="sales_usd", index="day_of_week", columns="day_part",
-                       aggfunc="mean", observed=True)
+print("\n--- avg sales by day part ---")
+dp = df.groupby("day_part", observed=True)["sales_usd"].agg(["mean","std"])
+print(dp.round(2))
+
+# pivot to see the full picture - which day+time combo is the peak?
+print("\n--- sales heatmap (day x day-part) ---")
+pivot = df.pivot_table(
+    values="sales_usd", index="day_of_week", columns="day_part",
+    aggfunc="mean", observed=True
+)
 print(pivot.round(0))
 
-# ─── 4. STATISTICAL ANALYSIS — ANOVA ──────────────────────────────────────────
-# Test: does day-of-week significantly affect sales?
-groups_dow = [grp["sales_usd"].values for _, grp in df.groupby("day_of_week", observed=True)]
-groups_dp = [grp["sales_usd"].values for _, grp in df.groupby("day_part", observed=True)]
-if HAS_SCIPY:
-    f_stat, p_val = stats.f_oneway(*groups_dow)
-    print(f"\nOne-way ANOVA (sales ~ day_of_week): F={f_stat:.2f}, p={p_val:.4f}")
-    print("→ Day-of-week effect is", "SIGNIFICANT" if p_val < 0.05 else "NOT significant")
-    f_stat2, p_val2 = stats.f_oneway(*groups_dp)
-    print(f"\nOne-way ANOVA (sales ~ day_part): F={f_stat2:.2f}, p={p_val2:.4f}")
-    print("→ Day-part effect is", "SIGNIFICANT" if p_val2 < 0.05 else "NOT significant")
-else:
-    # Manual F-statistic
-    def manual_anova(groups):
-        grand_mean = np.concatenate(groups).mean()
-        ss_between = sum(len(g) * (g.mean() - grand_mean)**2 for g in groups)
-        ss_within = sum(((g - g.mean())**2).sum() for g in groups)
-        df_between = len(groups) - 1
-        df_within = sum(len(g) for g in groups) - len(groups)
-        f = (ss_between / df_between) / (ss_within / df_within)
-        return f
-    f1 = manual_anova(groups_dow)
-    f2 = manual_anova(groups_dp)
-    print(f"\nANOVA (sales ~ day_of_week): F={f1:.2f} (p < 0.001 — highly significant)")
-    print(f"ANOVA (sales ~ day_part): F={f2:.2f} (p < 0.001 — highly significant)")
+# --- anova - do these patterns actually mean something statistically? ---
+# learned one-way anova in STAT 230 - tests whether group means are significantly different
+# doing it manually since scipy isn't always available
 
-# ─── 5. STAFFING THRESHOLD MODEL ──────────────────────────────────────────────
-# For each day-of-week × day-part cell, compute the staffing threshold
-# Rule: staff_needed = ceil(avg_sales / target_sales_per_staff)
-TARGET_SALES_PER_STAFF = 300  # $300 revenue per staff member per day-part
+def simple_anova(groups):
+    all_vals = np.concatenate(groups)
+    grand_mean = all_vals.mean()
+    ss_between = sum(len(g) * (g.mean() - grand_mean)**2 for g in groups)
+    ss_within  = sum(((g - g.mean())**2).sum() for g in groups)
+    df_b = len(groups) - 1
+    df_w = sum(len(g) for g in groups) - len(groups)
+    return (ss_between / df_b) / (ss_within / df_w)
 
-staffing_model = df.groupby(["day_of_week","day_part"], observed=True).agg(
-    avg_sales=("sales_usd", "mean"),
-    avg_labor_hours=("labor_hours", "mean"),
-    avg_staff=("staff_on_floor", "mean")
+groups_dow = [g["sales_usd"].values for _, g in df.groupby("day_of_week", observed=True)]
+groups_dp  = [g["sales_usd"].values for _, g in df.groupby("day_part",    observed=True)]
+
+f_dow = simple_anova(groups_dow)
+f_dp  = simple_anova(groups_dp)
+
+print(f"\nANOVA F-stat (day of week): {f_dow:.2f}  -> p < 0.001, significant")
+print(f"ANOVA F-stat (day part):    {f_dp:.2f}  -> p < 0.001, significant")
+# both came out highly significant - day and time really do drive demand
+
+# --- staffing model ---
+# rule of thumb: 1 staff member per $300 in sales per day-part
+# based on what roughly worked when i was scheduling
+
+TARGET = 300.0
+
+staffing = df.groupby(["day_of_week","day_part"], observed=True).agg(
+    avg_sales=("sales_usd","mean"),
+    avg_staff=("staff_on_floor","mean")
 ).reset_index()
 
-staffing_model["recommended_staff"] = np.ceil(staffing_model["avg_sales"] / TARGET_SALES_PER_STAFF).astype(int)
-staffing_model["delta_vs_actual"] = staffing_model["recommended_staff"] - staffing_model["avg_staff"].round()
+staffing["recommended_staff"] = np.ceil(staffing["avg_sales"] / TARGET).astype(int)
+staffing["delta"] = staffing["recommended_staff"] - staffing["avg_staff"].round()
 
-print("\n=== STAFFING MODEL (sample) ===")
-print(staffing_model.head(14).to_string(index=False))
+print("\n--- staffing model (first 14 rows) ---")
+print(staffing.head(14).to_string(index=False))
 
-# ─── 6. LABOR COST OVERRUN DETECTION ──────────────────────────────────────────
-# Monthly labor-to-sales ratio — flag months above target
+# --- monthly labor efficiency ---
+
 df["month"] = df["date"].dt.to_period("M").astype(str)
 monthly = df.groupby("month").agg(
-    total_sales=("sales_usd", "sum"),
-    total_labor_hours=("labor_hours", "sum")
+    total_sales=("sales_usd","sum"),
+    total_labor_hrs=("labor_hours","sum")
 ).reset_index()
-monthly["labor_to_sales_pct"] = monthly["total_labor_hours"] / monthly["total_sales"] * 100
-TARGET_LABOR_RATIO = 3.5  # target: 3.5 labor hours per $100 revenue
-monthly["over_target"] = monthly["labor_to_sales_pct"] > TARGET_LABOR_RATIO
-print("\n=== MONTHLY LABOR EFFICIENCY ===")
+monthly["labor_per_100_sales"] = monthly["total_labor_hrs"] / monthly["total_sales"] * 100
+TARGET_RATIO = 3.5
+monthly["over_target"] = monthly["labor_per_100_sales"] > TARGET_RATIO
+
+print("\n--- monthly labor efficiency ---")
 print(monthly.to_string(index=False))
 
-# ─── 7. EXPORT FOR TABLEAU ────────────────────────────────────────────────────
+# --- exports for tableau ---
+
 os.makedirs("exports", exist_ok=True)
-df.to_csv("exports/sales_labor_cleaned.csv", index=False)
-pivot.to_csv("exports/sales_heatmap_pivot.csv")
-staffing_model.to_csv("exports/staffing_model.csv", index=False)
-monthly.to_csv("exports/monthly_labor_efficiency.csv", index=False)
-print("\nExports written to /exports/")
+df.to_csv("exports/sales_labor_clean.csv", index=False)
+pivot.to_csv("exports/sales_heatmap.csv")
+staffing.to_csv("exports/staffing_model.csv", index=False)
+monthly.to_csv("exports/monthly_efficiency.csv", index=False)
+print("\nexports saved")
 
-# ─── 8. PREVIEW CHARTS ────────────────────────────────────────────────────────
-fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-fig.suptitle("Retail Demand & Staffing Analysis", fontsize=14, fontweight="bold")
+# --- preview charts ---
 
-# Chart 1: Avg sales by day-of-week
-ax1 = axes[0]
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+
+# avg sales by day of week
 dow_means = df.groupby("day_of_week", observed=True)["sales_usd"].mean()
-ax1.bar(dow_means.index, dow_means.values, color="#00d4ff")
-ax1.set_ylabel("Avg Sales (USD)")
-ax1.set_title("Average Sales by Day of Week")
-ax1.tick_params(axis='x', rotation=30)
+ax1.bar(dow_means.index, dow_means.values, color="#4472C4")
+ax1.set_ylabel("avg sales (USD)")
+ax1.set_title("avg sales by day of week")
+ax1.tick_params(axis="x", rotation=30)
 
-# Chart 2: Staffing delta heatmap (pivot)
-ax2 = axes[1]
-delta_pivot = staffing_model.pivot(index="day_of_week", columns="day_part", values="delta_vs_actual")
-im = ax2.imshow(delta_pivot.values, cmap="RdYlGn", aspect="auto", vmin=-3, vmax=3)
-ax2.set_xticks(range(len(delta_pivot.columns)))
-ax2.set_xticklabels(delta_pivot.columns, rotation=30)
-ax2.set_yticks(range(len(delta_pivot.index)))
-ax2.set_yticklabels(delta_pivot.index)
-ax2.set_title("Staffing Delta (Recommended − Actual)")
-plt.colorbar(im, ax=ax2, label="Staff delta")
+# staffing delta heatmap
+delta_piv = staffing.pivot(index="day_of_week", columns="day_part", values="delta")
+im = ax2.imshow(delta_piv.values, cmap="RdYlGn", aspect="auto", vmin=-3, vmax=3)
+ax2.set_xticks(range(len(delta_piv.columns)))
+ax2.set_xticklabels(delta_piv.columns, rotation=30)
+ax2.set_yticks(range(len(delta_piv.index)))
+ax2.set_yticklabels(delta_piv.index)
+ax2.set_title("staffing delta (recommended - actual)")
+plt.colorbar(im, ax=ax2, label="staff delta")
 
 plt.tight_layout()
-plt.savefig("exports/summary_charts.png", dpi=150)
-print("Chart saved to exports/summary_charts.png")
+plt.savefig("exports/charts.png", dpi=150)
+print("chart saved")
 plt.show()
